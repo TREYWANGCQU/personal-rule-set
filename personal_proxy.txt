@@ -3,4 +3,3 @@ payload:
   - DOMAIN-KEYWORD,linkedin
   - DOMAIN-SUFFIX,mitce.com
   - DOMAIN-KEYWORD,ednovas
-  - DOMAIN-SUFFIX,ipw.cn
