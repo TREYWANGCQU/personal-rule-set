@@ -1,0 +1,14 @@
+payload:
+  # cqu_url_listdomains
+  - DOMAIN-SUFFIX,cqu.edu.cn
+  - DOMAIN-SUFFIX,cnki.net
+  - DOMAIN-SUFFIX,superlib.net
+  - DOMAIN-SUFFIX,webofscience.com
+  - DOMAIN-SUFFIX,engineeringvillage.com
+  - DOMAIN-SUFFIX,elsevier.com
+  - DOMAIN-SUFFIX,wanfangdata.com.cn
+  - DOMAIN-SUFFIX,sciencedirect.com
+ 
+ 
+
+ 

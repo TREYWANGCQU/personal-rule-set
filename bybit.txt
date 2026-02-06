@@ -1,0 +1,15 @@
+payload:
+  # Bybit main domains
+  - DOMAIN-SUFFIX,bybit.com
+  - DOMAIN-SUFFIX,bybitglobal.com
+  - DOMAIN-SUFFIX,bytick.com
+  - DOMAIN-SUFFIX,bytab.io
+  - DOMAIN-SUFFIX,by-amazon.com
+  - DOMAIN-SUFFIX,bybits.com
+  - DOMAIN-SUFFIX,bybdc6.com
+  - DOMAIN-SUFFIX,byabcde.com
+  # API & websocket endpoints
+  - DOMAIN,api.bybit.com
+  - DOMAIN,api.bybitglobal.com
+  - DOMAIN,wss.bybit.com
+ 
