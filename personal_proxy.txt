@@ -1,5 +1,6 @@
 payload:
   - DOMAIN-SUFFIX,usmartsg.com
   - DOMAIN-KEYWORD,linkedin
+  - DOMAIN-KEYWORD,likcdn
   - DOMAIN-SUFFIX,mitce.com
   - DOMAIN-KEYWORD,ednovas
