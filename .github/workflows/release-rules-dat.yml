@@ -1,0 +1,300 @@
+# .github/workflows/release-rules-dat.yml
+name: Build and Release Rules DAT
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "*.txt"
+      - "tools/**"
+      - "go.mod"
+      - ".github/workflows/release-rules-dat.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "*.txt"
+      - "tools/**"
+      - "go.mod"
+      - ".github/workflows/release-rules-dat.yml"
+  schedule:
+    # Weekly on Sunday 20:00 UTC (Monday 04:00 UTC+8), ahead of 04:10 client sync.
+    - cron: "0 20 * * 0"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Build mode: all, personal-only, or public-only"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - personal-only
+          - public-only
+      tag:
+        description: "Optional custom release tag (leave empty for automatic tag)"
+        required: false
+        default: ""
+      force_release:
+        description: "Force creating/updating release even if all 4 SHA256 hashes are unchanged"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-rules-dat
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Run Go unit tests
+        run: go test -v ./tools/...
+
+      - name: Build and verify personal.dat
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          go run ./tools/personal-dat -in . -out dist/personal.dat | tee dist/personal-summary.txt
+          go run ./tools/personal-dat -verify -out dist/personal.dat
+          (cd dist && sha256sum -c personal.dat.sha256)
+          SIZE=$(wc -c < dist/personal.dat | tr -d ' ')
+          echo "personal.dat size: ${SIZE} bytes"
+          if [ "${SIZE}" -lt 32 ]; then
+            echo "ERROR: personal.dat size (${SIZE}) is below 32 bytes threshold" >&2
+            exit 1
+          fi
+
+      - name: Decide public rules build vs reuse
+        id: decide
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/prev-sha
+
+          # Download existing .sha256 files from latest release (best-effort) for diff guard later.
+          for f in personal.dat.sha256 geosite.dat.sha256 geoip.dat.sha256 anti-ad.dat.sha256; do
+            gh release download --pattern "${f}" --dir dist/prev-sha --clobber >/dev/null 2>&1 || true
+          done
+
+          NEED_PUBLIC="false"
+          if [ "${EVENT_NAME}" = "schedule" ]; then
+            NEED_PUBLIC="true"
+          elif [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ "${DISPATCH_MODE}" != "personal-only" ]; then
+            NEED_PUBLIC="true"
+          fi
+
+          if [ "${NEED_PUBLIC}" = "false" ]; then
+            echo "[INFO] Attempting to reuse public .dat artifacts from current latest release..."
+            REUSE_OK="true"
+            for f in geosite.dat geosite.dat.sha256 geoip.dat geoip.dat.sha256 anti-ad.dat anti-ad.dat.sha256; do
+              if ! gh release download --pattern "${f}" --dir dist --clobber >/dev/null 2>&1; then
+                echo "[WARN] Missing ${f} in latest release; falling back to full public rules build."
+                REUSE_OK="false"
+                break
+              fi
+            done
+            if [ "${REUSE_OK}" = "true" ]; then
+              if ! (cd dist && sha256sum -c geosite.dat.sha256 geoip.dat.sha256 anti-ad.dat.sha256); then
+                echo "[WARN] Reused public .dat checksum mismatch; falling back to full public rules build."
+                REUSE_OK="false"
+              fi
+            fi
+            if [ "${REUSE_OK}" = "false" ]; then
+              NEED_PUBLIC="true"
+            else
+              echo "[INFO] Reused public .dat artifacts from latest release successfully."
+            fi
+          fi
+
+          echo "build_public=${NEED_PUBLIC}" >> "${GITHUB_OUTPUT}"
+
+      - name: Fetch and build public rules (geosite, geoip, anti-ad)
+        if: github.event_name != 'pull_request' && steps.decide.outputs.build_public == 'true'
+        run: |
+          set -euo pipefail
+          UPSTREAM_DIR="dist/upstream"
+          mkdir -p "${UPSTREAM_DIR}"
+
+          XTLS_BASE="https://github.com/XTLS/Xray-rules-dat/releases/latest/download"
+
+          echo "[INFO] Fetching XTLS geosite.dat + sha256sum..."
+          curl -fsSL --retry 3 --retry-delay 5 --max-time 120 -o "${UPSTREAM_DIR}/geosite.dat" "${XTLS_BASE}/geosite.dat"
+          curl -fsSL --retry 3 --retry-delay 5 --max-time 60 -o "${UPSTREAM_DIR}/geosite.dat.sha256sum" "${XTLS_BASE}/geosite.dat.sha256sum"
+          (cd "${UPSTREAM_DIR}" && sha256sum -c geosite.dat.sha256sum)
+
+          echo "[INFO] Fetching XTLS geoip-lite.dat (fallback: geoip.dat) + sha256sum..."
+          if curl -fsSL --retry 3 --retry-delay 5 --max-time 120 -o "${UPSTREAM_DIR}/geoip-lite.dat" "${XTLS_BASE}/geoip-lite.dat" \
+            && curl -fsSL --retry 3 --retry-delay 5 --max-time 60 -o "${UPSTREAM_DIR}/geoip-lite.dat.sha256sum" "${XTLS_BASE}/geoip-lite.dat.sha256sum"; then
+            (cd "${UPSTREAM_DIR}" && sha256sum -c geoip-lite.dat.sha256sum)
+            GEOIP_IN="${UPSTREAM_DIR}/geoip-lite.dat"
+          else
+            curl -fsSL --retry 3 --retry-delay 5 --max-time 120 -o "${UPSTREAM_DIR}/geoip.dat" "${XTLS_BASE}/geoip.dat"
+            curl -fsSL --retry 3 --retry-delay 5 --max-time 60 -o "${UPSTREAM_DIR}/geoip.dat.sha256sum" "${XTLS_BASE}/geoip.dat.sha256sum"
+            (cd "${UPSTREAM_DIR}" && sha256sum -c geoip.dat.sha256sum)
+            GEOIP_IN="${UPSTREAM_DIR}/geoip.dat"
+          fi
+
+          echo "[INFO] Slicing geosite.dat and geoip.dat to CN,PRIVATE..."
+          go run ./tools/public-dat slice -kind geosite -in "${UPSTREAM_DIR}/geosite.dat" -out dist/geosite.dat -codes CN,PRIVATE | tee dist/geosite-summary.txt
+          go run ./tools/public-dat slice -kind geoip -in "${GEOIP_IN}" -out dist/geoip.dat -codes CN,PRIVATE | tee dist/geoip-summary.txt
+
+          echo "[INFO] Fetching privacy-protection-tools/anti-AD anti-ad-domains.txt..."
+          if ! curl -fsSL --retry 3 --retry-delay 5 --max-time 60 -o "${UPSTREAM_DIR}/anti-ad-domains.txt" \
+            "https://raw.githubusercontent.com/privacy-protection-tools/anti-AD/master/anti-ad-domains.txt"; then
+            echo "[WARN] Primary GitHub raw failed; falling back to https://anti-ad.net/domains.txt"
+            curl -fsSL --retry 3 --retry-delay 5 --max-time 60 -o "${UPSTREAM_DIR}/anti-ad-domains.txt" \
+              "https://anti-ad.net/domains.txt"
+          fi
+
+          echo "[INFO] Compiling anti-ad.dat (Code: ANTI-AD)..."
+          go run ./tools/public-dat anti-ad \
+            -in "${UPSTREAM_DIR}/anti-ad-domains.txt" \
+            -out dist/anti-ad.dat \
+            -code ANTI-AD \
+            -min-rules 10000 \
+            -max-invalid-ratio 0.05 | tee dist/anti-ad-summary.txt
+
+      - name: Verify all 4 release artifacts
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          go run ./tools/public-dat verify -kind geosite -in dist/geosite.dat -require-codes CN,PRIVATE -test-domain www.baidu.com -reject-domain google.com
+          go run ./tools/public-dat verify -kind geoip -in dist/geoip.dat -require-codes CN,PRIVATE -test-ip 114.114.114.114 -reject-ip 8.8.8.8
+          go run ./tools/public-dat verify -kind geoip -in dist/geoip.dat -require-codes CN,PRIVATE -test-ip 192.168.1.1 -test-code PRIVATE
+          go run ./tools/public-dat verify -kind geosite -in dist/anti-ad.dat -require-codes ANTI-AD -min-rules 10000 -reject-domain www.baidu.com
+
+          (cd dist && sha256sum -c personal.dat.sha256 geosite.dat.sha256 geoip.dat.sha256 anti-ad.dat.sha256)
+
+          check_min_size() {
+            local file="$1"
+            local min_bytes="$2"
+            local actual
+            actual=$(wc -c < "${file}" | tr -d ' ')
+            echo "${file}: ${actual} bytes (min ${min_bytes})"
+            if [ "${actual}" -lt "${min_bytes}" ]; then
+              echo "ERROR: ${file} size (${actual}) is below ${min_bytes} bytes" >&2
+              exit 1
+            fi
+          }
+
+          check_min_size dist/personal.dat 32
+          check_min_size dist/geosite.dat 32768
+          check_min_size dist/geoip.dat 32768
+          check_min_size dist/anti-ad.dat 102400
+
+      - name: Check SHA256 diff against latest release
+        id: diff
+        if: github.event_name != 'pull_request'
+        env:
+          FORCE_RELEASE: ${{ inputs.force_release }}
+        run: |
+          set -euo pipefail
+          CHANGED="false"
+          for f in personal.dat.sha256 geosite.dat.sha256 geoip.dat.sha256 anti-ad.dat.sha256; do
+            if [ ! -f "dist/prev-sha/${f}" ]; then
+              echo "[INFO] Previous ${f} not found in latest release -> release required."
+              CHANGED="true"
+              break
+            fi
+            OLD_HASH="$(awk '{print $1}' "dist/prev-sha/${f}")"
+            NEW_HASH="$(awk '{print $1}' "dist/${f}")"
+            if [ "${OLD_HASH}" != "${NEW_HASH}" ]; then
+              echo "[INFO] ${f} changed: ${OLD_HASH} -> ${NEW_HASH}"
+              CHANGED="true"
+            fi
+          done
+
+          if [ "${FORCE_RELEASE}" = "true" ]; then
+            echo "[INFO] force_release=true -> forcing release."
+            CHANGED="true"
+          fi
+
+          echo "should_release=${CHANGED}" >> "${GITHUB_OUTPUT}"
+          if [ "${CHANGED}" = "false" ]; then
+            echo "[INFO] All 4 .dat files are byte-identical to current latest release; skipping release."
+          fi
+
+      - name: Publish unified GitHub Release
+        if: github.event_name != 'pull_request' && steps.diff.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          CUSTOM_TAG: ${{ inputs.tag }}
+          BUILD_PUBLIC: ${{ steps.decide.outputs.build_public }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::7}"
+          DATE_UTC="$(date -u +%Y%m%d)"
+          if [ -n "${CUSTOM_TAG}" ]; then
+            TAG="${CUSTOM_TAG}"
+          elif [ "${EVENT_NAME}" = "schedule" ]; then
+            TAG="v${DATE_UTC}-weekly"
+          else
+            TAG="v${DATE_UTC}-${SHORT_SHA}"
+          fi
+
+          row() {
+            local name="$1"
+            local size sha
+            size="$(wc -c < "dist/${name}" | tr -d ' ')"
+            sha="$(awk '{print $1}' "dist/${name}.sha256")"
+            echo "| \`${name}\` | \`${size}\` B | \`${sha}\` |"
+          }
+
+          cat <<EOF > dist/release-notes.md
+          ## Rules DAT Release \`${TAG}\`
+
+          - **Trigger**: \`${EVENT_NAME}\` (public rules rebuilt: \`${BUILD_PUBLIC}\`)
+          - **Commit**: \`${GITHUB_SHA}\`
+
+          ### Artifacts Summary
+          | File | Size | SHA256 |
+          | :--- | :--- | :--- |
+          $(row personal.dat)
+          $(row geosite.dat)
+          $(row geoip.dat)
+          $(row anti-ad.dat)
+
+          ### Direct Download URLs (Latest)
+          - \`https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/personal.dat\`
+          - \`https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/geosite.dat\`
+          - \`https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/geoip.dat\`
+          - \`https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/anti-ad.dat\`
+          EOF
+
+          ASSETS=(
+            dist/personal.dat dist/personal.dat.sha256
+            dist/geosite.dat dist/geosite.dat.sha256
+            dist/geoip.dat dist/geoip.dat.sha256
+            dist/anti-ad.dat dist/anti-ad.dat.sha256
+          )
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${ASSETS[@]}" --clobber
+            gh release edit "${TAG}" --title "Rules DAT ${TAG}" --notes-file dist/release-notes.md --latest
+          else
+            gh release create "${TAG}" "${ASSETS[@]}" \
+              --title "Rules DAT ${TAG}" \
+              --notes-file dist/release-notes.md \
+              --latest
+          fi

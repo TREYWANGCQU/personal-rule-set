@@ -3,10 +3,6 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/hex"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -14,49 +10,22 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/TREYWANGCQU/personal-rule-set/tools/internal/geowire"
 )
 
-// DomainType mirrors xray.common.geodata.Domain_Type in common/geodata/geodat.proto.
-type DomainType uint32
+type DomainType = geowire.DomainType
 
 const (
-	DomainSubstr DomainType = 0
-	DomainRegex  DomainType = 1
-	DomainDomain DomainType = 2
-	DomainFull   DomainType = 3
+	DomainSubstr = geowire.DomainSubstr
+	DomainRegex  = geowire.DomainRegex
+	DomainDomain = geowire.DomainDomain
+	DomainFull   = geowire.DomainFull
 )
 
-func (t DomainType) String() string {
-	switch t {
-	case DomainSubstr:
-		return "Substr"
-	case DomainRegex:
-		return "Regex"
-	case DomainDomain:
-		return "Domain"
-	case DomainFull:
-		return "Full"
-	default:
-		return fmt.Sprintf("DomainType(%d)", uint32(t))
-	}
-}
-
-// Domain mirrors xray.common.geodata.Domain (fields 1 and 2).
-type Domain struct {
-	Type  DomainType
-	Value string
-}
-
-// GeoSite mirrors xray.common.geodata.GeoSite.
-type GeoSite struct {
-	Code   string
-	Domain []Domain
-}
-
-// GeoSiteList mirrors xray.common.geodata.GeoSiteList.
-type GeoSiteList struct {
-	Entry []GeoSite
-}
+type Domain = geowire.Domain
+type GeoSite = geowire.GeoSite
+type GeoSiteList = geowire.GeoSiteList
 
 type domainKey struct {
 	typ   DomainType
@@ -94,20 +63,10 @@ func main() {
 
 	data := marshalGeoSiteList(list)
 
-	if err := writeAtomic(*outFile, data); err != nil {
+	hexSum, err := geowire.WriteWithSHA256(*outFile, data, *writeSHA)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "[ERROR] write output failed: %v\n", err)
 		os.Exit(1)
-	}
-
-	sum := sha256.Sum256(data)
-	hexSum := hex.EncodeToString(sum[:])
-
-	if *writeSHA {
-		shaContent := fmt.Sprintf("%s  %s\n", hexSum, filepath.Base(*outFile))
-		if err := writeAtomic(*outFile+".sha256", []byte(shaContent)); err != nil {
-			fmt.Fprintf(os.Stderr, "[ERROR] write sha256 failed: %v\n", err)
-			os.Exit(1)
-		}
 	}
 
 	fmt.Printf("[OK] wrote %s (%d bytes, %d codes, sha256=%s)\n", *outFile, len(data), len(list.Entry), hexSum)
@@ -310,20 +269,6 @@ func trimQuotes(s string) string {
 	return s
 }
 
-func writeAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
 func verifyDat(path, testDomain, testCode string) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -360,226 +305,14 @@ func verifyDat(path, testDomain, testCode string) error {
 	return nil
 }
 
-func matchDomain(d Domain, target string) bool {
-	switch d.Type {
-	case DomainFull:
-		return target == d.Value
-	case DomainDomain:
-		return target == d.Value || strings.HasSuffix(target, "."+d.Value)
-	case DomainSubstr:
-		return strings.Contains(target, d.Value)
-	case DomainRegex:
-		re, err := regexp.Compile(d.Value)
-		return err == nil && re.MatchString(target)
-	default:
-		return false
-	}
-}
-
-// --- Zero-dependency Proto3 wire encoder/decoder for GeoSiteList ---
-
-const (
-	wireVarint  = 0
-	wireFixed64 = 1
-	wireBytes   = 2
-	wireFixed32 = 5
-)
-
-func appendTag(b []byte, fieldNum uint64, wireType uint64) []byte {
-	return binary.AppendUvarint(b, (fieldNum<<3)|wireType)
-}
-
-func appendBytesField(b []byte, fieldNum uint64, val []byte) []byte {
-	b = appendTag(b, fieldNum, wireBytes)
-	b = binary.AppendUvarint(b, uint64(len(val)))
-	return append(b, val...)
-}
-
-func marshalDomain(d Domain) []byte {
-	var b []byte
-	if d.Type != 0 {
-		b = appendTag(b, 1, wireVarint)
-		b = binary.AppendUvarint(b, uint64(d.Type))
-	}
-	if d.Value != "" {
-		b = appendBytesField(b, 2, []byte(d.Value))
-	}
-	return b
-}
-
-func marshalGeoSite(s GeoSite) []byte {
-	var b []byte
-	if s.Code != "" {
-		b = appendBytesField(b, 1, []byte(s.Code))
-	}
-	for _, d := range s.Domain {
-		b = appendBytesField(b, 2, marshalDomain(d))
-	}
-	return b
-}
-
 func marshalGeoSiteList(list *GeoSiteList) []byte {
-	var b []byte
-	if list == nil {
-		return b
-	}
-	for _, e := range list.Entry {
-		b = appendBytesField(b, 1, marshalGeoSite(e))
-	}
-	return b
-}
-
-func consumeVarint(b []byte) (uint64, int, error) {
-	v, n := binary.Uvarint(b)
-	if n == 0 {
-		return 0, 0, errors.New("truncated varint")
-	}
-	if n < 0 {
-		return 0, 0, errors.New("varint overflow")
-	}
-	return v, n, nil
-}
-
-func consumeBytes(b []byte) ([]byte, int, error) {
-	l, n, err := consumeVarint(b)
-	if err != nil {
-		return nil, 0, err
-	}
-	if l > uint64(len(b)-n) {
-		return nil, 0, errors.New("truncated length-delimited field")
-	}
-	end := n + int(l)
-	return b[n:end], end, nil
-}
-
-func skipField(b []byte, wireType uint64) (int, error) {
-	switch wireType {
-	case wireVarint:
-		_, n, err := consumeVarint(b)
-		return n, err
-	case wireFixed64:
-		if len(b) < 8 {
-			return 0, errors.New("truncated fixed64")
-		}
-		return 8, nil
-	case wireBytes:
-		_, n, err := consumeBytes(b)
-		return n, err
-	case wireFixed32:
-		if len(b) < 4 {
-			return 0, errors.New("truncated fixed32")
-		}
-		return 4, nil
-	default:
-		return 0, fmt.Errorf("unsupported wire type %d", wireType)
-	}
-}
-
-func unmarshalDomain(b []byte) (Domain, error) {
-	var d Domain
-	for len(b) > 0 {
-		tag, n, err := consumeVarint(b)
-		if err != nil {
-			return Domain{}, err
-		}
-		b = b[n:]
-		fieldNum := tag >> 3
-		wireType := tag & 0x7
-		switch {
-		case fieldNum == 1 && wireType == wireVarint:
-			v, m, err := consumeVarint(b)
-			if err != nil {
-				return Domain{}, err
-			}
-			d.Type = DomainType(v)
-			b = b[m:]
-		case fieldNum == 2 && wireType == wireBytes:
-			raw, m, err := consumeBytes(b)
-			if err != nil {
-				return Domain{}, err
-			}
-			d.Value = string(raw)
-			b = b[m:]
-		default:
-			m, err := skipField(b, wireType)
-			if err != nil {
-				return Domain{}, err
-			}
-			b = b[m:]
-		}
-	}
-	return d, nil
-}
-
-func unmarshalGeoSite(b []byte) (GeoSite, error) {
-	var s GeoSite
-	for len(b) > 0 {
-		tag, n, err := consumeVarint(b)
-		if err != nil {
-			return GeoSite{}, err
-		}
-		b = b[n:]
-		fieldNum := tag >> 3
-		wireType := tag & 0x7
-		switch {
-		case fieldNum == 1 && wireType == wireBytes:
-			raw, m, err := consumeBytes(b)
-			if err != nil {
-				return GeoSite{}, err
-			}
-			s.Code = string(raw)
-			b = b[m:]
-		case fieldNum == 2 && wireType == wireBytes:
-			raw, m, err := consumeBytes(b)
-			if err != nil {
-				return GeoSite{}, err
-			}
-			d, err := unmarshalDomain(raw)
-			if err != nil {
-				return GeoSite{}, err
-			}
-			s.Domain = append(s.Domain, d)
-			b = b[m:]
-		default:
-			m, err := skipField(b, wireType)
-			if err != nil {
-				return GeoSite{}, err
-			}
-			b = b[m:]
-		}
-	}
-	return s, nil
+	return geowire.MarshalGeoSiteList(list)
 }
 
 func unmarshalGeoSiteList(b []byte) (*GeoSiteList, error) {
-	list := &GeoSiteList{}
-	for len(b) > 0 {
-		tag, n, err := consumeVarint(b)
-		if err != nil {
-			return nil, err
-		}
-		b = b[n:]
-		fieldNum := tag >> 3
-		wireType := tag & 0x7
-		switch {
-		case fieldNum == 1 && wireType == wireBytes:
-			raw, m, err := consumeBytes(b)
-			if err != nil {
-				return nil, err
-			}
-			site, err := unmarshalGeoSite(raw)
-			if err != nil {
-				return nil, err
-			}
-			list.Entry = append(list.Entry, site)
-			b = b[m:]
-		default:
-			m, err := skipField(b, wireType)
-			if err != nil {
-				return nil, err
-			}
-			b = b[m:]
-		}
-	}
-	return list, nil
+	return geowire.UnmarshalGeoSiteList(b)
+}
+
+func matchDomain(d Domain, target string) bool {
+	return geowire.MatchDomain(d, target)
 }
