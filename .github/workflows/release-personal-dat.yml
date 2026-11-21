@@ -1,0 +1,107 @@
+# .github/workflows/release-personal-dat.yml
+name: Build and Release personal.dat
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "*.txt"
+      - "tools/personal-dat/**"
+      - "go.mod"
+      - ".github/workflows/release-personal-dat.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "*.txt"
+      - "tools/personal-dat/**"
+      - "go.mod"
+      - ".github/workflows/release-personal-dat.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional custom release tag (leave empty for vYYYYMMDD-<shortsha>)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-personal-dat-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Run compiler unit tests
+        run: go test -v ./tools/personal-dat/...
+
+      - name: Build personal.dat
+        run: |
+          mkdir -p dist
+          go run ./tools/personal-dat -in . -out dist/personal.dat | tee dist/build-summary.txt
+
+      - name: Verify personal.dat integrity
+        run: |
+          go run ./tools/personal-dat -verify -out dist/personal.dat
+          (cd dist && sha256sum -c personal.dat.sha256)
+          SIZE=$(wc -c < dist/personal.dat | tr -d ' ')
+          echo "personal.dat size: ${SIZE} bytes"
+          if [ "${SIZE}" -lt 32 ]; then
+            echo "ERROR: personal.dat size (${SIZE}) is below 32 bytes threshold" >&2
+            exit 1
+          fi
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CUSTOM_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::7}"
+          DATE_UTC="$(date -u +%Y%m%d)"
+          TAG="${CUSTOM_TAG:-v${DATE_UTC}-${SHORT_SHA}}"
+
+          SHA256_VAL="$(awk '{print $1}' dist/personal.dat.sha256)"
+          SIZE="$(wc -c < dist/personal.dat | tr -d ' ')"
+
+          cat <<EOF > dist/release-notes.md
+          ## personal.dat Release \`${TAG}\`
+
+          - **Commit**: \`${GITHUB_SHA}\`
+          - **Size**: \`${SIZE}\` bytes
+          - **SHA256**: \`${SHA256_VAL}\`
+
+          ### Compiled Rule Groups
+          \`\`\`text
+          $(cat dist/build-summary.txt)
+          \`\`\`
+
+          ### Direct Download URLs (Latest)
+          - \`https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/personal.dat\`
+          - \`https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/personal.dat.sha256\`
+          EOF
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/personal.dat dist/personal.dat.sha256 --clobber
+            gh release edit "${TAG}" --title "personal.dat ${TAG}" --notes-file dist/release-notes.md --latest
+          else
+            gh release create "${TAG}" dist/personal.dat dist/personal.dat.sha256 \
+              --title "personal.dat ${TAG}" \
+              --notes-file dist/release-notes.md \
+              --latest
+          fi

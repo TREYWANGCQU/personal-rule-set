@@ -1,0 +1,7 @@
+doc/
+dist/
+*.dat
+*.dat.sha256
+dist/
+*.dat
+*.dat.sha256
